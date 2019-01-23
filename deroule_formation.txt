@@ -1,0 +1,647 @@
+# To  push a message in the queue associated with the Lambda
+aws sqs send-message \
+ --queue-url "https://sqs.eu-west-3.amazonaws.com/077987486732/training2019-01-HelloworldQueue" \
+ --message-body '{ "firstName": "Nicolas", "lastName": "Fonrose", "appCode": "200" }'
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 1 - Création de l'instance SugarCRM/SuiteCRM telle que packagée par Bitnami
+#
+ 
+ 
+ 
+#
+# Create the SuiteCRM web frontend security group
+#
+# Authorize trafic to SuiteCRM from the "Acme" network
+SECURITYGROUP_WEBFRONTEND_ID=$(aws ec2 create-security-group \
+  --region "eu-west-3" \
+  --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" \
+  --description "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" | sed 's/\r//g')
+aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --protocol "tcp" --port "80" --cidr "195.6.88.12/32"
+aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --protocol "tcp" --port "22" --cidr "195.6.88.12/32"
+ 
+ 
+# First creation of SuiteCRM instance
+INSTANCEID=$(aws ec2 run-instances --region "eu-west-3" --image-id "ami-01595b905d09d236e" --count "1" --instance-type "t2.micro" --key-name "KEYPAIR-TRAINING-PJ_000-Jan19" --security-groups "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --query "Instances[0].InstanceId" | sed 's/\r//g')
+VOLUMEID=$(aws ec2 describe-volumes --region "eu-west-3" --filters "Name=attachment.instance-id,Values=$INSTANCEID" --query "Volumes[0].VolumeId" | sed 's/\r//g')
+aws ec2 create-tags --resources $INSTANCEID $VOLUMEID --tags "Key=Application,Value=SuiteCRM" "Key=Component,Value=Template-FrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 2 - Création de la base RDS
+#
+ 
+ 
+ 
+#
+# Create the RDS instance
+#
+# Authorize trafic to MySQL from the "Web frontend" source group
+aws ec2 create-security-group \
+    --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-DB" \
+    --description "TRAINING-Teevity-Jan19_000-SuiteCRM-DB"
+aws ec2 authorize-security-group-ingress \
+    --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-DB" \
+    --protocol "tcp" \
+    --port "3306" \
+    --source-group "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend"
+DBSECURITYGROUPID=$(aws ec2 describe-security-groups \
+    --group-names "TRAINING-Teevity-Jan19_000-SuiteCRM-DB" \
+    --query "SecurityGroups[0].GroupId" | sed 's/\r//g')
+ 
+ 
+ 
+ 
+# Create the RDS instance.
+# Remark : Infos base MySQL SuiteCRM
+#  'db_user_name' => 'bn_suitecrm',
+#  'db_password' => '3b1ec44baf',
+#  'db_name' => 'bitnami_suitecrm',
+aws rds create-db-instance \
+     --db-instance-identifier "suitecrm-db-000" \
+     --allocated-storage "5" \
+     --region "eu-west-3" \
+     --db-instance-class "db.t2.micro" \
+     --engine "MySQL" \
+     --engine-version "5.6.35" \
+     --no-multi-az \
+     --master-username "bn_suitecrm" \
+     --master-user-password "203d6818f9" \
+     --vpc-security-group-ids "$DBSECURITYGROUPID" \
+     --tags \
+          "Key=Application,Value=SuiteCRM" \
+          "Key=Component,Value=BackendDB" \
+          "Key=Owner,Value=Trainee001" \
+          "Key=Context,Value=Training" \
+          "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" \
+          "Key=Tenant,Value=Acme"
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 3 - Transfert des données vers la base RDS
+#
+#       Step 3.1 - Dump en local de la base de données
+#       Step 3.1.1 - Récupération du mot de passe de la base de données locale
+#       Step 3.1.2 - Utilisation de mysqldump pour extraire les données dans un fichier backup.sql
+#
+#       Step 3.2 - Injection des données dans la base RDS (en utilisant le fichier backup.sql)
+#       Step 3.2.1 - Utilisation de mysql pour importer les données vers RDS
+#
+#       Step 3.3 - Arrêt de la base locale (pour être sûr qu'on utilise bien la base Remote)
+#
+#       Step 3.4 - On bascule SuiteCRM vers la base RDS
+#       Step 3.4.1 - On modifie le fichier de configuration de SuiteCRM (on met le nom DNS de la base RDS)
+#       Step 3.4.2 - Redémarrage du serveur Apache pour prendre en compte les modifications du fichier de configuration
+#
+#       Step 3.5 - On essaie d'accéder de nouveau à SuiteCRM sur l'instance
+#
+#
+#    REMARQUE : Pour toutes ces étapes, vous devez être connecté en SSH sur l'instance EC2
+#
+# ------------------------------------------------------------------------------------------------
+ 
+ 
+ 
+    #
+    # SSH on the instance SuiteCRM instance to get the DB password
+    #
+    #    chmod 600 /home/usere/Documents/AWSlabs/TRAINING-June2016-TeevityTraining.pem
+    #    ssh -i /home/usere/Documents/AWSlabs/TRAINING-June2016-TeevityTraining.pem ubuntu@52.28.121.131
+    #
+    #
+ 
+ 
+    #
+    #       Step 3.1 - Dump en local de la base de données
+    #       Step 3.1.1 - Récupération du mot de passe de la base de données locale
+    # ------------------------------------------------------------------------------------------------
+ 
+        # Edit the configuration file to find (and change) the DB configuration
+             vim /opt/bitnami/apps/suitecrm/htdocs/config.php
+        #
+        #
+        #  Configuration found inside the SuiteCRM (search for db_configuration)
+        #
+              'dbconfig' =>
+              array (
+                'db_host_name' => 'localhost:3306',
+                'db_host_instance' => '',
+                'db_user_name' => 'bn_suitecrm',
+                'db_password' => '3b1ec44baf',
+                'db_name' => 'bitnami_suitecrm',
+                'db_type' => 'mysql',
+                'db_port' => '',
+                'db_manager' => 'MysqliManager',
+              ),
+ 
+ 
+ 
+    #
+    #       Step 3.1 - Dump en local de la base de données
+    #       Step 3.1.2 - Utilisation de mysqldump pour extraire les données dans un fichier backup.sql
+    # ------------------------------------------------------------------------------------------------
+ 
+     
+        #
+        # BEGIN - Instructions MySQL pour manipuler le contenu de la base SuiteCRM (pas du code IaC)
+        #
+     
+            # Export the SuiteCRM database content to an .sql file
+            mysqldump -ubn_suitecrm -pd2ccb0004d -h127.0.0.1 bitnami_suitecrm > backup.sql
+ 
+ 
+ 
+    #
+    #       Step 3.2 - Injection des données dans la base RDS (en utilisant le fichier backup.sql)
+    #       Step 3.2.1 - Utilisation de mysql pour importer les données vers RDS
+    # ------------------------------------------------------------------------------------------------
+ 
+ 
+            # Import the database content into the RDS instance
+            mysql -ubn_suitecrm -p203d6818f9 -hsuitecrm-db-000.cxpoolgcgzmp.eu-west-3.rds.amazonaws.com -e "create database bitnami_suitecrm"
+            mysql -ubn_suitecrm -p203d6818f9 bitnami_suitecrm -hsuitecrm-db-000.cxpoolgcgzmp.eu-west-3.rds.amazonaws.com < backup.sql
+ 
+ 
+ 
+    #
+    #       Step 3.3 - Arrêt de la base locale (pour être sûr qu'on utilise bien la base Remote)
+   # ------------------------------------------------------------------------------------------------
+ 
+ 
+           # Then stop the local MySQL Instance (to prove that we are indeed using the RDS instance)
+           sudo /opt/bitnami/ctlscript.sh stop mysql
+ 
+ 
+   #
+   #       Step 3.4 - On bascule SuiteCRM vers la base RDS
+   #       Step 3.4.1 - On modifie le fichier de configuration de SuiteCRM (on met le nom DNS de la base RDS)
+   # ------------------------------------------------------------------------------------------------
+ 
+ 
+ 
+ 
+   #       Step 3.4 - On bascule SuiteCRM vers la base RDS
+   #       Step 3.4.2 - Redémarrage du serveur Apache pour prendre en compte les modifications du fichier de configuration
+   # ------------------------------------------------------------------------------------------------
+ 
+ 
+            # RESTART the service (since Fev 2018, the modification of the config file alone is not enough)
+           sudo /opt/bitnami/ctlscript.sh restart apache
+ 
+ 
+   #
+   #       Step 3.5 - On essaie d'accéder de nouveau à SuiteCRM sur l'instance
+   # ------------------------------------------------------------------------------------------------
+ 
+             'dbconfig' =>
+             array (
+               'db_host_name' => 'suitecrm-db-000.cxpoolgcgzmp.eu-west-3.rds.amazonaws.com:3306',
+               'db_host_instance' => '',
+               'db_user_name' => 'bn_suitecrm',
+               'db_password' => '203d6818f9',
+               'db_name' => 'bitnami_suitecrm',
+               'db_type' => 'mysql',
+               'db_port' => '',
+               'db_manager' => 'MysqliManager',
+             ),
+ 
+ 
+       #
+       # END - Instructions MySQL pour manipuler le contenu de la base SuiteCRM (pas du code IaC)
+       #
+   
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 4 - On crée une image machine paramétrable
+#
+ 
+ 
+   #
+   # AMI - Make the AMI configurable
+   #
+   # BEGIN - Generate the logic to patch the SuiteCRM DB configuration at startup
+   #
+   #         This will work if the SuiteCRM configuration has been modified to
+   #         contain ##RDS_HOSTNAME##, ##RDS_PORT##, ... in the configuration file
+   #
+   #           'dbconfig' =>
+   #           array (
+   #             'db_host_name' => '##RDS_HOSTNAME##:##RDS_PORT##',
+   #             'db_host_instance' => '',
+   #             'db_user_name' => '##RDS_DBMASTERUSER##',
+   #             'db_password' => '##RDS_DBMASTERPASSWORD##',
+   #             'db_name' => 'bitnami_suitecrm',
+   #             'db_type' => 'mysql',
+   #             'db_port' => '',
+   #             'db_manager' => 'MysqliManager',
+   #           ),
+   #
+   #         The UserData must be in the following form (CAUTION:Don't forget the
+    #         last CR after the RDS_DBMASTERPASSWORD line)
+    #            RDS_HOSTNAME=suitecrm-db-000.cmpuqika5eco.eu-west-3.rds.amazonaws.com
+    #            RDS_PORT=3306
+    #            RDS_DBMASTERUSER=bn_suitecrm
+    #            RDS_DBMASTERPASSWORD=203d6818f9
+    #
+    #
+ 
+sudo su
+cat << EOF > /etc/init.d/patchSuiteCRMDBConfiguration
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:       orsystraining
+# Required-Start: \$ALL
+# Required-Stop:  
+# Default-Start:  2 3 4 5
+# Default-Stop:  
+# Short-Description: Orsys Training SuiteCRM StartScript
+# Description:  Orsys Training SuiteCRM StartScript
+### END INIT INFO
+ 
+#
+# Patch the SuiteCRM DB configuration file
+#
+#   - Extract the parameters from the UserData into environment variables
+#
+curl http://169.254.169.254/latest/user-data > /tmp/currentUserData.txt
+if grep -q '<h1>404 - Not Found</h1>' '/tmp/currentUserData.txt'; then
+    # There is no UserData in this case
+    echo "No UserData"
+else
+  while read LINE
+  do
+    # Check if the line start with a #
+    if [[ "\${LINE}" =~ ^#.* ]]; then
+      echo "Ignored value : \${LINE}"
+ 
+    else
+      KEY=\$(echo "\${LINE}" | cut -d "=" -f1)
+      VALUE=\$(echo "\${LINE}" | cut -d "=" -f2 | sed -e "s/'//g")
+      declare "\${KEY}"="\${VALUE}"
+    fi
+ 
+  done < /tmp/currentUserData.txt
+ 
+  #
+  #   - Patching SuiteCRM DB configuration (with the values extracted from the UserData)
+  #
+  sed -i.bak "s/##RDS_HOSTNAME##/\${RDS_HOSTNAME}/g" /opt/bitnami/apps/suitecrm/htdocs/config.php
+  sed -i "s/##RDS_PORT##/\${RDS_PORT}/g" /opt/bitnami/apps/suitecrm/htdocs/config.php
+  sed -i "s/##RDS_DBMASTERUSER##/\${RDS_DBMASTERUSER}/g" /opt/bitnami/apps/suitecrm/htdocs/config.php
+  sed -i "s/##RDS_DBMASTERPASSWORD##/\${RDS_DBMASTERPASSWORD}/g" /opt/bitnami/apps/suitecrm/htdocs/config.php
+ 
+  # Restart the SuiteCRM application to ensure that the DB configuration changes are taken into account
+  service bitnami restart apache
+fi
+ 
+EOF
+sudo chmod +x /etc/init.d/patchSuiteCRMDBConfiguration
+# Create the links into the rc2.d
+#   sudo update-rc.d patchSuiteCRMDBConfiguration disable
+sudo update-rc.d patchSuiteCRMDBConfiguration defaults
+ 
+ 
+    #
+    # END - Generate the logic to patch the SuiteCRM DB configuration at startup
+    #
+ 
+ 
+# Image creation
+#
+#    
+#    aws ec2 describe-images --owner self
+#    aws ec2 deregister-image --image-id $IMAGEID
+#
+INSTANCEID_TEMPLATE=$INSTANCEID
+IMAGEID=$(aws ec2 create-image --instance-id $INSTANCEID_TEMPLATE --name "TRAINING-Teevity-Jan19_000-SuiteCRM-ParametrableAMI" --query "ImageId" | sed 's/\r//g')
+aws ec2 create-tags --resources $IMAGEID --tags "Key=Application,Value=SuiteCRM" "Key=Component,Value=FrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"
+ 
+ 
+ 
+#
+# SuiteCRM instance creation with UserData to configure the MySQL instance used (RDS, local, ...)
+#
+#   IMAGEID=ami-e74ef99a
+#
+ 
+INSTANCEID=$(aws ec2 run-instances --region "eu-west-3" --image-id "$IMAGEID" --count "1" --instance-type "t2.micro" --key-name "KEYPAIR-TRAINING-PJ_000-Jan19" --security-groups "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --query "Instances[0].InstanceId" --user-data \
+"RDS_HOSTNAME=suitecrm-db-000.cxpoolgcgzmp.eu-west-3.rds.amazonaws.com
+RDS_PORT=3306
+RDS_DBMASTERUSER=bn_suitecrm
+RDS_DBMASTERPASSWORD=203d6818f9
+" | sed 's/\r//g')
+VOLUMEID=$(aws ec2 describe-volumes --region "eu-west-3" --filters "Name=attachment.instance-id,Values=$INSTANCEID" --query "Volumes[0].VolumeId" | sed 's/\r//g')
+aws ec2 create-tags --resources $INSTANCEID $VOLUMEID --tags "Key=Application,Value=SuiteCRM" "Key=Component,Value=FrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 5 - Autoscaling (les bases)
+#
+#
+ 
+#   - We want the instance to autoregister itself to the ELB. So it needs to have the
+#     rights to do so. We are going to do that using an IAM Role
+#     REMARK : We could also configure the Autoscaling group
+ 
+#   - Creation of the Launch configuration for the "Web frontend"
+#     REMARK : You must be in the directory where the userdata file is located
+#
+aws autoscaling create-launch-configuration
+     --launch-configuration-name "aws-training-Jan19_000-suitecrm-webfrontend-launchconfig"
+     --image-id "$IMAGEID"
+     --user-data "file://userData-SuiteCRM-Frontend.data"
+     --key-name "KEYPAIR-TRAINING-PJ_000-Jan19"
+     --instance-type "t2.micro"
+     --security-groups "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend"
+#   - Creation of the Autoscaling Group for the "Web frontend"
+aws autoscaling create-auto-scaling-group
+     --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg"
+     --launch-configuration-name "aws-training-Jan19_000-suitecrm-webfrontend-launchconfig"
+     --min-size "1"
+     --max-size "1"
+     --desired-capacity "1"
+     --availability-zones "eu-west-3a" "eu-west-3b"
+     --health-check-type "ELB"
+     --health-check-grace-period "30"
+     --tags
+          "Key=Application,Value=SuiteCRM"
+          "Key=Component,Value=FrontEnd"
+          "Key=Owner,Value=Trainee001"
+          "Key=Context,Value=Training"
+          "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00"
+          "Key=Tenant,Value=Acme"
+#   - Modify Autoscaling Group to "pause" the application
+aws autoscaling update-auto-scaling-group
+     --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg"
+     --min-size 0
+     --max-size 0
+#   - Modify Autoscaling Group to "restart" the application
+aws autoscaling update-auto-scaling-group
+     --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg"
+     --min-size 2
+     --max-size 6
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 6 - Loab-balancing
+#
+#    STEP 6.1 - Refactoring de la partie SecurityGroup du front-end
+#    STEP 6.2 - Loab-balancing
+#
+ 
+ 
+#  SecurityGroup Refactoring
+#    - One SecurityGroup for the ELB
+#          -> TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb
+#    - One SecurityGroup for the instances behind the ELB
+#          -> TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend
+#
+ 
+# - Creation of the ELB SecurityGroup
+SECURITYGROUP_WEBFRONTEND_ELB_ID=$(aws ec2 create-security-group \
+   --region "eu-west-3" \
+   --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb" \
+   --description "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb" | sed 's/\r//g')
+aws ec2 authorize-security-group-ingress
+    --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb"
+    --protocol "tcp"
+    --port "80"
+    --cidr "195.6.88.12/32"
+ 
+# - Modification of the existing 'TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend'
+#   SecurityGroup
+aws ec2 authorize-security-group-ingress
+    --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend"
+    --protocol "tcp"
+    --port "80"
+    --source-group "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb"
+aws ec2 revoke-security-group-ingress
+    --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend"
+    --protocol "tcp"
+    --port "80"
+    --cidr "195.6.88.12/32"
+ 
+ 
+ 
+ 
+ 
+ 
+# ELB
+ 
+#   - Create the ELB
+aws elb create-load-balancer \
+     --load-balancer-name "suitecrm-elb-PJ000" \
+     --listeners "Protocol=HTTP,LoadBalancerPort=80,InstanceProtocol=HTTP,InstancePort=80" \
+     --availability-zones "eu-west-3a" "eu-west-3b" \
+     --security-groups "$SECURITYGROUP_WEBFRONTEND_ELB_ID" \
+     --tags "Key=Application,Value=SuiteCRM" "Key=Component,Value=FrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"
+#   - Configure the ELB
+aws elb configure-health-check \
+     --load-balancer-name "suitecrm-elb-PJ000" \
+     --health-check "Target=HTTP:80/index.php?action=Login&module=Users&Source=HealthCheck,Interval=5,UnhealthyThreshold=2,HealthyThreshold=2,Timeout=2"
+#   - Attach the ELB to the Load-balancer so that if the instance is still alive but
+#        doesn't respond to the ELB (at the application level), the ELB can notify the
+#        ASG so that the instance get destroyed and another one gets started
+#     REMARK: We could also create the ELB/ASG link through CloudInit UserData scripts
+#             executed by the instances (aws elb register-instances) but that wouldn't cover
+#             the case described above
+aws autoscaling attach-load-balancers \
+     --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg" \
+     --load-balancer-names "suitecrm-elb-PJ000"
+ 
+#
+#  We can do it now !!! :-) The code below is no longer needed.
+#
+#    # Find the ELB SecurityGroup (we cannot force it at ELB creation time if we are creating the ELB in the default VPC :-( )
+#    ELB_SECURITYGROUPID=$(aws elb describe-load-balancers --load-balancer-name "suitecrm-elb" --query "LoadBalancerDescriptions[0].SecurityGroups[0]" | sed 's/"//g')
+#    # - Configure the 'SuiteCRM web frontend ELB' security group to only authorize trafic to SuiteCRM from the "Acme Anteuil"
+#    aws ec2 revoke-security-group-ingress --group-id "${ELB_SECURITYGROUPID}" --protocol "tcp" --port "80" --cidr "0.0.0.0/0"
+#    aws ec2 authorize-security-group-ingress --group-id "${ELB_SECURITYGROUPID}" --protocol "tcp" --port "80" --cidr "109.190.85.95/32"
+#    #   - Add the ELB Security group as a source of trafic for the TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend security group (the one for the instances so that they can receive trafic from the ELB)
+#    aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --protocol "tcp" --port "80" --source-group "${ELB_SECURITYGROUPID}"
+#    #   - Remove the direct access to the instances from the Web
+#    aws ec2 revoke-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend" --protocol "tcp" --port "80" --cidr "109.190.85.95/32"
+#    #
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 6 - Generation de charge sur le système + Autoscaling (Load-generation)
+#
+#
+#
+ 
+# - Creation of the Load Generation SecurityGroup
+SECURITYGROUP_LOADGENERATION_ID=$(aws ec2 create-security-group \
+   --region "eu-west-3" \
+   --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration" \
+   --description "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration" | sed 's/\r//g')
+aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration" --protocol "tcp" --port "22" --cidr "195.6.88.12/32"
+aws ec2 revoke-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration" --protocol "tcp" --port "22" --cidr "195.6.88.12/32"
+# - Authorize ingress from the LoadGeneration-SG at the Webfront-ELB level
+aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb" --protocol "tcp" --port "80" --source-group "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration"
+aws ec2 authorize-security-group-ingress --group-name "TRAINING-Teevity-Jan19_000-SuiteCRM-Webfrontend-elb" --protocol "tcp" --port "80" --cidr "52.47.147.250/32"
+ 
+# Create a Load Generation instance (t2.micro)
+LOADGENERATION_INSTANCEID=$(aws ec2 run-instances --image-id "ami-5ce55321" --key-name "KEYPAIR-TRAINING-PJ_000-Jan19" --instance-type "t2.micro"  --security-groups "TRAINING-Teevity-Jan19_000-SuiteCRM-LoadGeneration" --query "Instances[0].InstanceId" --tag-specifications "ResourceType=instance, Tags=[{Key=Application,Value=SuiteCRM},{Key=Component,Value=LoadGeneration},{Key=Owner,Value=Trainee001},{Key=Context,Value=Training},{Key=ShouldBeDeletedBy,Value=2019-01-23_16-00},{Key=Tenant,Value=Acme}]" "ResourceType=volume, Tags=[{Key=Application,Value=SuiteCRM},{Key=Component,Value=LoadGeneration},{Key=Owner,Value=Trainee001},{Key=Context,Value=Training},{Key=ShouldBeDeletedBy,Value=2019-01-23_16-00},{Key=Tenant,Value=Acme}]" | sed 's/\r//g')
+ 
+    #
+    # Connect to the instance using SSH
+    # REMARK : It's an Amazin Linux instance. The SSH user is ec2-user
+   #          ssh -i <...> ec2-user@<IP>
+   #
+ 
+   #
+   # BEGIN - Commandes exécutées sur l'instance 'Load generation' pour lui faire générer de la charge (pas du code IaC)
+    #
+ 
+        # Install Apache AB on the instance
+        sudo yum install httpd-tools
+        # Execute the load Test
+        ab -n 500000 -c 1 "http://suitecrm-elb-pj000-1149879171.eu-west-3.elb.amazonaws.com/index.php?action=Login&module=Users" &
+ 
+        ab -n 500000 -c 10 "http://172.31.15.244/index.php?action=Login&module=Users"
+       
+ 
+    #
+    # END - Commandes exécutées sur l'instance 'Load generation' pour lui faire générer de la charge (pas du code IaC)
+   #
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 7 - Configure Autoscaling
+#
+#  Remark: Here is how the ScalingPolicy ARN looks like
+#   arn:aws:autoscaling:eu-west-3:077987486732:scalingPolicy:026016f2-2281-441a-9000-4169d312792d:autoScalingGroupName/aws-training-Jan19_000-suitecrm-webfrontend-asg:policyName/aws-training-Jan19_000-suitecrm-webfrontend-scaleUp
+#
+#
+#   - Define the scaling policies (Up and Down)
+#        - ScaleUp policy
+SCALEUP_ACTIONARN=$(aws autoscaling put-scaling-policy --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg" --policy-name "aws-training-Jan19_000-suitecrm-webfrontend-scaleUp" --scaling-adjustment "1" --adjustment-type "ChangeInCapacity" --cooldown "60")
+#        - ScaleDown policy
+SCALEDOWN_ACTIONARN=$(aws autoscaling put-scaling-policy --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg" --policy-name "aws-training-Jan19_000-suitecrm-webfrontend-scaleDown" --scaling-adjustment "-1" --adjustment-type "ChangeInCapacity" --cooldown "60")
+#   - Create the Cloudwatch alarms and link the alarms to the Scaling policies
+#      - Create a HighCPU alarm
+aws cloudwatch put-metric-alarm --alarm-name "aws-training-Jan19_000-suitecrm-webfrontend-highCPU-alarm" --alarm-description "Alarm when CPU exceeds 60 percent for the SuiteCRM web frontend" --dimensions "Name=AutoScalingGroupName,Value=aws-training-Jan19_000-suitecrm-webfrontend-asg" --statistic "Average" --metric-name "CPUUtilization" --namespace "AWS/EC2" --period "60" --comparison-operator "GreaterThanThreshold" --threshold "60" --unit "Percent" --evaluation-periods 1 --alarm-actions "$SCALEUP_ACTIONARN"
+#      - Create a LowCPU alarm
+aws cloudwatch put-metric-alarm --alarm-name "aws-training-Jan19_000-suitecrm-webfrontend-lowCPU-alarm" --alarm-description "Alarm when CPU goes under 30 percent for the SuiteCRM web frontend" --dimensions "Name=AutoScalingGroupName,Value=aws-training-Jan19_000-suitecrm-webfrontend-asg" --statistic "Average" --metric-name "CPUUtilization" --namespace "AWS/EC2" --comparison-operator "LessThanThreshold" --threshold "30" --unit Percent --period "60" --evaluation-periods "1" --alarm-actions "$SCALEDOWN_ACTIONARN"
+ 
+ 
+#
+#  Alternate scaling option: target tracking
+#
+aws autoscaling put-scaling-policy --policy-name "targetTrackingPolicy-cpu75" --auto-scaling-group-name "aws-training-Jan19_000-suitecrm-webfrontend-asg" --policy-type "TargetTrackingScaling" --target-tracking-configuration "file://targetTrackingPolicy-cpu75.json"
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+# ------------------------------------------------------------------------------------------------
+#
+#    STEP 8 - IaC avec CloudFormation
+#
+#
+#
+ 
+# CloudFormation
+#   - Creation of the CloudFormer stack to retro-engineer the infrastructure we've created during the lab
+aws cloudformation create-stack \
+   --region "eu-central-1" \
+    --stack-name "AWSTraining-Jan19-CloudFormer" \
+    --template-body "https://s3.eu-west-3.amazonaws.com/cloudformation-templates-eu-west-3/CloudFormer.template" \
+    --parameters "ParameterKey=Username,ParameterValue=Trainee001,UsePreviousValue=false" "ParameterKey=Password,ParameterValue=Acme,UsePreviousValue=false" \
+    --capabilities "CAPABILITY_IAM" \
+    --tags "Key=Application,Value=CloudFormer" "Key=Component,Value=WebFrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"
+ 
+ 
+# CloudFormation
+#   - Creation of the CloudFormer stack to retro-engineer the infrastructure we've created during the lab
+#       --capabilities "CAPABILITY_IAM" \
+#
+aws cloudformation create-stack \
+  --region "eu-west-3" \
+  --stack-name "Training-SuiteCRM-Stack-002" \
+  --template-body "file://suiteCRM-cloudformation.template" \
+   --parameters \
+         "ParameterKey=SUGARCRMDBHOSTNAME,ParameterValue=suitecrm-db-000.cxpoolgcgzmp.eu-west-3.rds.amazonaws.com,UsePreviousValue=false" \
+         "ParameterKey=NETWORKCONSTRAINTCIDR,ParameterValue=195.6.88.12,UsePreviousValue=false" \
+   --tags "Key=Application,Value=CloudFormer" "Key=Component,Value=WebFrontEnd" "Key=Owner,Value=Trainee001" "Key=Context,Value=Training" "Key=ShouldBeDeletedBy,Value=2019-01-23_16-00" "Key=Tenant,Value=Acme"

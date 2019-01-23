@@ -1,0 +1,55 @@
+import json
+ 
+print('Loading function')
+ 
+ 
+def lambda_handler(event, context):
+ 
+    print("DEBUG Received [" + str(len(event['Records'])) + "] events")  
+ 
+    # Initialize the array of messages that we can't process now
+    messagesThatCantBeProcessedNow = []
+ 
+    # Handle all the messages    
+    for eventRecord in event['Records']:
+        print("DEBUG Processing event: " + json.dumps(eventRecord, indent=2))
+ 
+        # Decode the JSON message passed via SQS
+        #
+        #     aws sqs send-message \
+        #           --queue-url "https://sqs.eu-west-3.amazon^Cs.com/077987486732/training2019-01-HelloworldQueue"  \
+        #           --message-body '{ "firstName": "Eugene", "lastName": "Fonrose", "appCode": "200" }'
+        #
+        eventMessage = json.loads(eventRecord['body'])
+       
+        print("firstName = " + eventMessage['firstName'])
+        print("lastName = " + eventMessage['lastName'])
+        print("appCode = " + eventMessage['appCode'])
+ 
+        if eventMessage['appCode']=="666":
+          # Send the message to a queue of message that can't be dealt with right now
+          # This avoid having to refuse all the messages loaded in this batch
+          messagesThatCantBeProcessedNow.append(eventRecord)
+ 
+    # Handle the non handled messages
+    if len(messagesThatCantBeProcessedNow) > 0:
+      sendMessageToRetryQueue(messagesThatCantBeProcessedNow)
+ 
+    # Tout va bien
+    response = {
+      "statusCode": 200
+    }
+    return response
+ 
+ 
+ 
+def sendMessageToRetryQueue(messagesThatCantBeProcessedNow):
+  print "There are messages that couldn't be processed now:" + str(len(messagesThatCantBeProcessedNow))
+ 
+ 
+ 
+ 
+# QUICK TEST of the LAMBDA, WITH THE SIMULATION OF A MESSAGE FORMATTED 'THE SQS WAY'
+eventObject = json.loads("{\r\n    \"Records\": [\r\n        {\r\n            \"messageId\": \"059f36b4-87a3-44ab-83d2-661975830a7d\",\r\n            \"receiptHandle\": \"AQEBwJnKyrHigUMZj6rYigCgxlaS3SLy0a...\",\r\n            \"body\": \"{ \\\"firstName\\\": \\\"Nicolas\\\", \\\"lastName\\\": \\\"Fonrose\\\", \\\"appCode\\\": \\\"200\\\" }\",\r\n            \"attributes\": {\r\n                \"ApproximateReceiveCount\": \"1\",\r\n                \"SentTimestamp\": \"1545082649183\",\r\n                \"SenderId\": \"AIDAIENQZJOLO23YVJ4VO\",\r\n                \"ApproximateFirstReceiveTimestamp\": \"1545082649185\"\r\n            },\r\n            \"messageAttributes\": {},\r\n            \"md5OfBody\": \"098f6bcd4621d373cade4e832627b4f6\",\r\n            \"eventSource\": \"aws:sqs\",\r\n            \"eventSourceARN\": \"arn:aws:sqs:us-east-2:123456789012:my-queue\",\r\n            \"awsRegion\": \"us-east-2\"\r\n        }\r\n    ]\r\n}")
+contextObject = {}
+lambda_handler(eventObject, contextObject)
